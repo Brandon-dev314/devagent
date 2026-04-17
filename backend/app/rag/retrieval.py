@@ -1,4 +1,5 @@
 import logging
+import uuid
 from qdrant_client import QdrantClient, AsyncQdrantClient
 from qdrant_client.models import (
     Distance,
@@ -8,7 +9,7 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue,
 )
-from app.models.schemas import DocumentMetadata
+
 from app.config import settings
 from app.models.schemas import DocumentChunk, SearchResult
 from app.rag.embeddings import EMBEDDING_DIMENSIONS
@@ -17,6 +18,7 @@ logger = logging.getLogger("devagent.retrieval")
 
 
 class RetrievalService:
+
     def __init__(
         self,
         host: str | None = None,
@@ -26,14 +28,17 @@ class RetrievalService:
         self.host = host or settings.qdrant_host
         self.port = port or settings.qdrant_port
         self.collection_name = collection_name or settings.qdrant_collection
+
         is_cloud = "cloud.qdrant.io" in self.host
-        
+
         client_kwargs = {
             "host": self.host,
             "port": self.port,
             "https": is_cloud,
             "api_key": settings.qdrant_api_key if is_cloud else None,
+            "timeout": 60,  
         }
+
         self.client = QdrantClient(**client_kwargs)
         self.async_client = AsyncQdrantClient(**client_kwargs)
 
@@ -55,19 +60,23 @@ class RetrievalService:
             logger.info("Collection '%s' already exists", self.collection_name)
 
     def upsert_chunks(self, chunks: list[DocumentChunk]) -> int:
+
         if not chunks:
             return 0
 
         points = []
         for chunk in chunks:
             if chunk.embedding is None:
-                logger.warning("Chunk %s no tiene embedding, saltando", chunk.chunk_id)
+                logger.warning("Chunk %s has no embedding, skipping", chunk.chunk_id)
                 continue
 
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id))
+
             point = PointStruct(
-                id=chunk.chunk_id,
+                id=point_id,
                 vector=chunk.embedding,
                 payload={
+                    "chunk_id": chunk.chunk_id,  
                     "text": chunk.text,
                     "chunk_index": chunk.chunk_index,
                     "source": chunk.metadata.source,
@@ -81,7 +90,6 @@ class RetrievalService:
 
         if not points:
             return 0
-
 
         self.client.upsert(
             collection_name=self.collection_name,
@@ -108,9 +116,7 @@ class RetrievalService:
                     )
                 ]
             )
-            
-        if not self.async_client:
-            raise RuntimeError("Qdrant client not initialized")
+
         results = await self.async_client.query_points(
             collection_name=self.collection_name,
             query=query_embedding,
@@ -123,8 +129,10 @@ class RetrievalService:
         search_results = []
         for point in results.points:
             payload = point.payload or {}
+
+            from app.models.schemas import DocumentMetadata, DocumentChunk
             chunk = DocumentChunk(
-                chunk_id=str(point.id),
+                chunk_id=payload.get("chunk_id", str(point.id)),
                 text=payload.get("text", ""),
                 chunk_index=payload.get("chunk_index", 0),
                 metadata=DocumentMetadata(
@@ -133,7 +141,7 @@ class RetrievalService:
                     doc_type=payload.get("doc_type", "markdown"),
                     language=payload.get("language", "en"),
                 ),
-                embedding=None,  
+                embedding=None,
             )
 
             search_results.append(
@@ -150,11 +158,14 @@ class RetrievalService:
 
     async def get_collection_info(self) -> dict:
         try:
+            if not self.async_client:
+                raise RuntimeError("Qdrant client not initialized")
+
             info = await self.async_client.get_collection(self.collection_name)
             return {
                 "name": self.collection_name,
                 "points_count": info.points_count,
-                "status": info.status.value,
+                "status": str(info.status),
             }
         except Exception as e:
             return {"name": self.collection_name, "error": str(e)}
