@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
     qdrant_collection: str = "devagent_docs"
+    
+    qdrant_api_key: str = Field(
+        default="",
+        description="API key para Qdrant Cloud. Vacío si usas Qdrant local.",
+    )
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432

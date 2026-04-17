@@ -26,16 +26,23 @@ class RetrievalService:
         self.host = host or settings.qdrant_host
         self.port = port or settings.qdrant_port
         self.collection_name = collection_name or settings.qdrant_collection
-
-        self.client = QdrantClient(host=self.host, port=self.port)
-        self.async_client = AsyncQdrantClient(host=self.host, port=self.port)
+        is_cloud = "cloud.qdrant.io" in self.host
+        
+        client_kwargs = {
+            "host": self.host,
+            "port": self.port,
+            "https": is_cloud,
+            "api_key": settings.qdrant_api_key if is_cloud else None,
+        }
+        self.client = QdrantClient(**client_kwargs)
+        self.async_client = AsyncQdrantClient(**client_kwargs)
 
     def ensure_collection(self) -> None:
         collections = self.client.get_collections().collections
         exists = any(c.name == self.collection_name for c in collections)
 
         if not exists:
-            logger.info("📦 Creating Qdrant collection '%s'...", self.collection_name)
+            logger.info("Creating Qdrant collection '%s'...", self.collection_name)
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
@@ -43,9 +50,9 @@ class RetrievalService:
                     distance=Distance.COSINE,
                 ),
             )
-            logger.info("✅ Collection '%s' created", self.collection_name)
+            logger.info("Collection '%s' created", self.collection_name)
         else:
-            logger.info("📦 Collection '%s' already exists", self.collection_name)
+            logger.info("Collection '%s' already exists", self.collection_name)
 
     def upsert_chunks(self, chunks: list[DocumentChunk]) -> int:
         if not chunks:
@@ -54,7 +61,7 @@ class RetrievalService:
         points = []
         for chunk in chunks:
             if chunk.embedding is None:
-                logger.warning("⚠️ Chunk %s no tiene embedding, saltando", chunk.chunk_id)
+                logger.warning("Chunk %s no tiene embedding, saltando", chunk.chunk_id)
                 continue
 
             point = PointStruct(
@@ -81,7 +88,7 @@ class RetrievalService:
             points=points,
         )
 
-        logger.info("📥 Upserted %d chunks into '%s'", len(points), self.collection_name)
+        logger.info("Upserted %d chunks into '%s'", len(points), self.collection_name)
         return len(points)
 
     async def search(
@@ -134,7 +141,7 @@ class RetrievalService:
             )
 
         logger.info(
-            "🔍 Search returned %d results (threshold=%.2f)",
+            "Search returned %d results (threshold=%.2f)",
             len(search_results),
             score_threshold,
         )
