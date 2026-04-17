@@ -1,0 +1,157 @@
+import logging
+from qdrant_client import QdrantClient, AsyncQdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
+from app.models.schemas import DocumentMetadata
+from app.config import settings
+from app.models.schemas import DocumentChunk, SearchResult
+from app.rag.embeddings import EMBEDDING_DIMENSIONS
+
+logger = logging.getLogger("devagent.retrieval")
+
+
+class RetrievalService:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        collection_name: str | None = None,
+    ):
+        self.host = host or settings.qdrant_host
+        self.port = port or settings.qdrant_port
+        self.collection_name = collection_name or settings.qdrant_collection
+
+        self.client = QdrantClient(host=self.host, port=self.port)
+        self.async_client = AsyncQdrantClient(host=self.host, port=self.port)
+
+    def ensure_collection(self) -> None:
+        collections = self.client.get_collections().collections
+        exists = any(c.name == self.collection_name for c in collections)
+
+        if not exists:
+            logger.info("📦 Creating Qdrant collection '%s'...", self.collection_name)
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_DIMENSIONS,
+                    distance=Distance.COSINE,
+                ),
+            )
+            logger.info("✅ Collection '%s' created", self.collection_name)
+        else:
+            logger.info("📦 Collection '%s' already exists", self.collection_name)
+
+    def upsert_chunks(self, chunks: list[DocumentChunk]) -> int:
+        if not chunks:
+            return 0
+
+        points = []
+        for chunk in chunks:
+            if chunk.embedding is None:
+                logger.warning("⚠️ Chunk %s no tiene embedding, saltando", chunk.chunk_id)
+                continue
+
+            point = PointStruct(
+                id=chunk.chunk_id,
+                vector=chunk.embedding,
+                payload={
+                    "text": chunk.text,
+                    "chunk_index": chunk.chunk_index,
+                    "source": chunk.metadata.source,
+                    "title": chunk.metadata.title,
+                    "doc_type": chunk.metadata.doc_type,
+                    "language": chunk.metadata.language,
+                    "ingested_at": chunk.metadata.ingested_at.isoformat(),
+                },
+            )
+            points.append(point)
+
+        if not points:
+            return 0
+
+
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+        )
+
+        logger.info("📥 Upserted %d chunks into '%s'", len(points), self.collection_name)
+        return len(points)
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        score_threshold: float = 0.5,
+        source_filter: str | None = None,
+    ) -> list[SearchResult]:
+        query_filter = None
+        if source_filter:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value=source_filter),
+                    )
+                ]
+            )
+            
+        if not self.async_client:
+            raise RuntimeError("Qdrant client not initialized")
+        results = await self.async_client.query_points(
+            collection_name=self.collection_name,
+            query=query_embedding,
+            limit=top_k,
+            score_threshold=score_threshold,
+            query_filter=query_filter,
+            with_payload=True,
+        )
+
+        search_results = []
+        for point in results.points:
+            payload = point.payload or {}
+            chunk = DocumentChunk(
+                chunk_id=str(point.id),
+                text=payload.get("text", ""),
+                chunk_index=payload.get("chunk_index", 0),
+                metadata=DocumentMetadata(
+                    source=payload.get("source", ""),
+                    title=payload.get("title", ""),
+                    doc_type=payload.get("doc_type", "markdown"),
+                    language=payload.get("language", "en"),
+                ),
+                embedding=None,  
+            )
+
+            search_results.append(
+                SearchResult(chunk=chunk, score=point.score)
+            )
+
+        logger.info(
+            "🔍 Search returned %d results (threshold=%.2f)",
+            len(search_results),
+            score_threshold,
+        )
+
+        return search_results
+
+    async def get_collection_info(self) -> dict:
+        try:
+            info = await self.async_client.get_collection(self.collection_name)
+            return {
+                "name": self.collection_name,
+                "points_count": info.points_count,
+                "status": info.status.value,
+            }
+        except Exception as e:
+            return {"name": self.collection_name, "error": str(e)}
+
+
+# Singleton
+retrieval_service = RetrievalService()
